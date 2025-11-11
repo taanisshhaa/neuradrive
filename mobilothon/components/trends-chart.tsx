@@ -402,10 +402,9 @@ export default function TrendsChart() {
   }
 
   const commonProps = {
-    width: "100%",
-    height: 400,
     margin: { top: 5, right: 30, left: 0, bottom: 5 },
   }
+  
 
   return (
     <div className="space-y-6">
