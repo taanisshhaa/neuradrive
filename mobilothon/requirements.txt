@@ -1,0 +1,10 @@
+# Frontend dependencies are managed via package.json / package-lock.json.
+# Install with:
+#   npm ci     (reproducible, uses package-lock)
+# or
+#   npm install
+
+# Node version suggestion (optional):
+#   Node 20+
+
+
