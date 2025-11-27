@@ -8,11 +8,23 @@ import uuid
 import os
 import secrets
 
+from logic import (
+    compute_fatigue_instant,
+    compute_fatigue_personalized,
+    forecast_next_scores,
+    decide_escalation,
+    escalation_action
+)
+
+
 from cryptography.fernet import Fernet
 
 from datetime import datetime
-# --- PERSONALIZED PROFILES (in-memory for now) ---
-user_profiles = {}
+
+
+
+# --- ADAPTIVE ESCALATION STATE (per user) ---
+driver_escalation_state: Dict[str, dict] = {}
 
 # --- PERSONALIZED PROFILES (in-memory for now) ---
 user_profiles: Dict[str, dict] = {}
@@ -35,11 +47,10 @@ ENCRYPTION_KEY = os.environ.get("NEURODRIVE_SNIPPET_KEY") or Fernet.generate_key
 fernet = Fernet(ENCRYPTION_KEY)
 
 
-app = FastAPI(title="NeuroDrive Backend")
+
 
 # In-memory store
-alerts = []
-fatigue_history = []
+
 
 @app.get("/")
 def home():
@@ -139,6 +150,7 @@ def predict(data: DriverData):
         "yawn_ratio": data.yawn_ratio,
         "has_snippet": False
     }
+    
 
     # 4. Append to global histories
     fatigue_history.append(event_record)
@@ -146,28 +158,72 @@ def predict(data: DriverData):
     if data.user_id not in driver_timeline:
         driver_timeline[data.user_id] = []
     driver_timeline[data.user_id].append(event_record)
+   
 
     # 5. Legacy alerts list (optional)
     alerts.append({"score": score, "status": status})
 
-    # 6. Simple intervention suggestion (you can upgrade later)
-    if score > 80:
-        intervention = "⚠️ STRONG ALERT"
-    elif score > 60:
-        intervention = "💡 SOFT ALERT"
-    else:
-        intervention = "✅ NORMAL"
+    # ---------- ADAPTIVE ESCALATION SYSTEM ----------
+
+    now_ts = datetime.now().timestamp()
+
+    # Initialize user state if new
+    if data.user_id not in driver_escalation_state:
+        driver_escalation_state[data.user_id] = {
+            "level": 0,
+            "last_change": now_ts,
+            "recent_scores": []
+        }
+
+    state = driver_escalation_state[data.user_id]
+
+    # Maintain rolling window of last 10 scores
+    state["recent_scores"].append(score)
+    state["recent_scores"] = state["recent_scores"][-10:]
+
+    # Predict future trend using EMA forecast
+    forecast = forecast_next_scores(state["recent_scores"], steps=5)
+
+    # Decide next escalation level
+    new_level = decide_escalation(
+        level=state["level"],
+        score=score,
+        forecast=forecast
+    )
+
+    # Reset escalation if driver recovers
+    if score < 45:
+        new_level = 0
+
+    # Update state if level changed
+    if new_level != state["level"]:
+        state["level"] = new_level
+        state["last_change"] = now_ts
+
+    # Get physical/system action
+    intervention = escalation_action(state["level"])
+    event_record["escalation_level"] = driver_escalation_state[data.user_id]["level"]
+    event_record["intervention"] = intervention
 
     return {
         "fatigue_score": score,
         "status": status,
         "intervention": intervention,
+        "escalation_level": state["level"],
         "mode": data.mode,
         "event_id": event_id,
         "event_type": event_type,
-        "tags": tags
+        "tags": tags,
+        "forecast": forecast
     }
 
+
+@app.get("/escalation/{user_id}")
+def get_escalation_state(user_id: str):
+    if user_id not in driver_escalation_state:
+        return {"message": "No escalation state for this user yet"}
+
+    return driver_escalation_state[user_id]
 
 
 # ---------- HISTORY ----------

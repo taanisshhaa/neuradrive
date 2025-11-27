@@ -66,20 +66,67 @@ def compute_fatigue_personalized(
 
 
 def forecast_next_scores(recent_scores: list[int], steps: int = 5) -> list[float]:
-    """Very simple EMA-based forecast for the next few minutes.
-    Returns a list of predicted fatigue scores for the next `steps` intervals.
+    """
+    EMA forecast biased toward current value to capture sudden fatigue spikes.
     """
     if not recent_scores:
         return [0.0] * steps
-    # Exponential moving average as state
-    alpha = 0.4
-    ema = float(recent_scores[0])
-    for s in recent_scores[1:]:
+
+    alpha = 0.5
+    current = float(recent_scores[-1])  # MOST RECENT SCORE
+    ema = current
+
+    # Backward smoothing
+    for s in reversed(recent_scores[:-1]):
         ema = alpha * s + (1 - alpha) * ema
-    # Assume mean-reverting slight drift towards latest value
-    predictions: list[float] = []
-    current = ema
+
+    predictions = []
     for _ in range(steps):
-        current = alpha * ema + (1 - alpha) * current
-        predictions.append(round(max(0.0, min(100.0, current)), 2))
+        ema = 0.7 * current + 0.3 * ema   # Bias toward current spike
+        predictions.append(round(max(0.0, min(100.0, ema)), 2))
+
     return predictions
+
+def decide_escalation(level: int, score: int, forecast: list[float]):
+    """
+    Correct priority-based adaptive escalation:
+    - Highest risk is checked first
+    - Allows instant jump to critical levels
+    """
+    predicted_risk = max(forecast) if forecast else score
+
+    # 🔴 EMERGENCY — immediate jump
+    if score >= 90 or predicted_risk >= 90:
+        return 4
+
+    # 🟠 CRITICAL — pull over immediately
+    if score >= 80 or predicted_risk >= 80:
+        return 3
+
+    # 🟡 HIGH — vibration
+    if score >= 65 or predicted_risk >= 70:
+        return 2
+
+    # 🔵 MODERATE — gentle alert
+    if score >= 50 or predicted_risk >= 60:
+        return 1
+
+    # 🟢 SAFE — reset
+    return 0
+
+
+
+def escalation_action(level: int):
+    """
+    Maps escalation level to physical/logical action.
+    """
+    if level == 0:
+        return "✅ Normal monitoring"
+    elif level == 1:
+        return "🔊 Gentle audio alert"
+    elif level == 2:
+        return "📳 Trigger vibration"
+    elif level == 3:
+        return "🚨 Strong alert + instruct to pull over"
+    elif level == 4:
+        return "📞 Notify emergency contact"
