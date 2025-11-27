@@ -1,13 +1,15 @@
 
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from models import DriverData, TimelineEvent, SnippetMeta
+from models import DriverData, TimelineEvent, SnippetMeta, EmergencyContact
 from datetime import datetime
 from typing import List, Dict
 import uuid
+import time
 import os
 import secrets
-
+from cryptography.fernet import Fernet
+from twilio.rest import Client 
 from logic import (
     compute_fatigue_instant,
     compute_fatigue_personalized,
@@ -15,6 +17,8 @@ from logic import (
     decide_escalation,
     escalation_action
 )
+from dotenv import load_dotenv
+load_dotenv()
 
 
 from cryptography.fernet import Fernet
@@ -30,6 +34,10 @@ driver_escalation_state: Dict[str, dict] = {}
 user_profiles: Dict[str, dict] = {}
 
 app = FastAPI(title="NeuroDrive Backend")
+# --- EMERGENCY CONTACTS (per user) ---
+emergency_contacts: Dict[str, List[dict]] = {}   # user_id -> list of {phone_number, name}
+last_emergency_sms: Dict[str, float] = {}        # user_id -> last-sent timestamp
+EMERGENCY_COOLDOWN_SECONDS = 5                 # 5 minutes cooldown between SMS for same user
 
 # In-memory stores
 alerts: List[dict] = []
@@ -46,8 +54,73 @@ os.makedirs(SNIPPETS_DIR, exist_ok=True)
 ENCRYPTION_KEY = os.environ.get("NEURODRIVE_SNIPPET_KEY") or Fernet.generate_key()
 fernet = Fernet(ENCRYPTION_KEY)
 
+# --- SNIPPET STORAGE / ENCRYPTION ---
+SNIPPETS_DIR = "snippets"
+os.makedirs(SNIPPETS_DIR, exist_ok=True)
+
+ENCRYPTION_KEY = os.environ.get("NEURODRIVE_SNIPPET_KEY") or Fernet.generate_key()
+fernet = Fernet(ENCRYPTION_KEY)
+
+# --- TWILIO CONFIG ---
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
+        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    except Exception:
+        twilio_client = None  # Fail safe: app should still run without SMS
 
 
+def send_emergency_sms(user_id: str, score: int, event_id: str, timestamp: str):
+    """
+    Sends SMS to all registered emergency contacts for the given user.
+    Respects a per-user cooldown to avoid spamming.
+    """
+    # 1. Check Twilio configuration
+    if twilio_client is None or not TWILIO_FROM_NUMBER:
+        return False, "Twilio not configured"
+
+    contacts = emergency_contacts.get(user_id, [])
+    if not contacts:
+        return False, "No emergency contacts configured for this user"
+
+    now = time.time()
+    last = last_emergency_sms.get(user_id, 0)
+    if now - last < EMERGENCY_COOLDOWN_SECONDS:
+        return False, "Cooldown active, not sending duplicate SMS"
+
+    # 2. Build message
+    msg_body = (
+        f"NeuroDrive ALERT: Critical driver fatigue detected for user '{user_id}' "
+        f"at {timestamp}. Score: {score}. Event ID: {event_id}. "
+        "Please contact the driver and ensure they stop driving safely."
+    )
+
+    # 3. Send SMS to each contact
+    any_sent = False
+    for contact in contacts:
+        to_number = contact.get("phone_number")
+        if not to_number:
+            continue
+        try:
+            twilio_client.messages.create(
+                body=msg_body,
+                from_=TWILIO_FROM_NUMBER,
+                to=to_number
+            )
+            any_sent = True
+        except Exception as e:
+            # For now we silently ignore individual failures; you can log them later
+            continue
+
+    if any_sent:
+        last_emergency_sms[user_id] = now
+        return True, "SMS sent"
+    else:
+        return False, "Failed to send to all contacts"
 
 # In-memory store
 
@@ -77,6 +150,28 @@ def calibrate(user_id: str, open_ears: List[float], closed_ears: List[float]):
     return {
         "message": "Calibration complete",
         "profile": user_profiles[user_id]
+    }
+
+@app.post("/users/{user_id}/emergency-contacts")
+def set_emergency_contacts(user_id: str, contacts: List[EmergencyContact]):
+    """
+    Configure or replace emergency contacts for a user.
+    """
+    emergency_contacts[user_id] = [c.dict() for c in contacts]
+    return {
+        "user_id": user_id,
+        "contacts": emergency_contacts[user_id]
+    }
+
+
+@app.get("/users/{user_id}/emergency-contacts")
+def get_emergency_contacts(user_id: str):
+    """
+    Fetch current emergency contacts for a user.
+    """
+    return {
+        "user_id": user_id,
+        "contacts": emergency_contacts.get(user_id, [])
     }
 
 from logic import compute_fatigue_instant, compute_fatigue_personalized
@@ -195,6 +290,8 @@ def predict(data: DriverData):
     if score < 45:
         new_level = 0
 
+    old_level = state["level"]
+
     # Update state if level changed
     if new_level != state["level"]:
         state["level"] = new_level
@@ -202,8 +299,22 @@ def predict(data: DriverData):
 
     # Get physical/system action
     intervention = escalation_action(state["level"])
-    event_record["escalation_level"] = driver_escalation_state[data.user_id]["level"]
+
+    # Attach escalation info to event record
+    event_record["escalation_level"] = state["level"]
     event_record["intervention"] = intervention
+
+    # 🔔 Trigger SMS if we just entered level 4
+    sms_triggered = False
+    sms_message = None
+    if state["level"] == 4 and old_level < 4:
+        sms_triggered, sms_message = send_emergency_sms(
+            user_id=data.user_id,
+            score=score,
+            event_id=event_id,
+            timestamp=ts
+        )
+
 
     return {
         "fatigue_score": score,
@@ -214,8 +325,11 @@ def predict(data: DriverData):
         "event_id": event_id,
         "event_type": event_type,
         "tags": tags,
-        "forecast": forecast
+        "forecast": forecast,
+        "sms_triggered": sms_triggered,
+        "sms_info": sms_message
     }
+
 
 
 @app.get("/escalation/{user_id}")

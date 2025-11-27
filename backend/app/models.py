@@ -33,3 +33,7 @@ class SnippetMeta(BaseModel):
     file_name: str
     duration_seconds: Optional[float] = None
     share_token: Optional[str] = None
+
+class EmergencyContact(BaseModel):
+    phone_number: str         # E.164 format recommended: +91xxxxxxxxxx
+    name: Optional[str] = None
