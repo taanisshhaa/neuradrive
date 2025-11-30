@@ -37,3 +37,21 @@ class SnippetMeta(BaseModel):
 class EmergencyContact(BaseModel):
     phone_number: str         # E.164 format recommended: +91xxxxxxxxxx
     name: Optional[str] = None
+
+class SafeStopRequest(BaseModel):
+    user_id: str
+    lat: float
+    lng: float
+    max_distance_m: Optional[int] = 5000   # search radius, default 5km
+
+
+class SafeStopPlace(BaseModel):
+    name: str
+    lat: float
+    lng: float
+    address: Optional[str] = None
+    place_id: Optional[str] = None
+    type: Optional[str] = None
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    maps_url: Optional[str] = None

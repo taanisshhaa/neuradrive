@@ -14,7 +14,7 @@ mobilothon/.env.*.local
 # Generic env files (root or elsewhere)
 .env
 .env.*
-
+backend/app/.env
 # Logs
 logs
 *.log

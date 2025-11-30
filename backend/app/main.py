@@ -22,8 +22,17 @@ load_dotenv()
 
 
 from cryptography.fernet import Fernet
+import requests
 
 from datetime import datetime
+from models import (
+    DriverData,
+    TimelineEvent,
+    SnippetMeta,
+    EmergencyContact,
+    SafeStopRequest,
+    SafeStopPlace,
+)
 
 
 
@@ -73,6 +82,104 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     except Exception:
         twilio_client = None  # Fail safe: app should still run without SMS
 
+# --- GOOGLE MAPS CONFIG ---
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+
+
+def find_safe_stops(
+    lat: float,
+    lng: float,
+    max_distance_m: int = 5000,
+    max_results: int = 5,
+) -> List[SafeStopPlace]:
+    """
+    Uses Google Places Nearby Search to find safe pull-over locations
+    like parking lots, rest areas, or gas stations.
+    Falls back to dummy data if API key is missing or request fails.
+    """
+    # If no API key, return dummy suggestions near given lat/lng (for local testing)
+    if not GOOGLE_MAPS_API_KEY:
+        return [
+            SafeStopPlace(
+                name="Demo Rest Stop",
+                lat=lat + 0.001,
+                lng=lng + 0.001,
+                address="Demo Street 1",
+                type="demo_rest_area",
+                rating=4.5,
+                user_ratings_total=120,
+                maps_url=f"https://www.google.com/maps/search/?api=1&query={lat+0.001},{lng+0.001}",
+            ),
+            SafeStopPlace(
+                name="Demo Parking Area",
+                lat=lat - 0.001,
+                lng=lng - 0.001,
+                address="Demo Street 2",
+                type="demo_parking",
+                rating=4.2,
+                user_ratings_total=80,
+                maps_url=f"https://www.google.com/maps/search/?api=1&query={lat-0.001},{lng-0.001}",
+            ),
+        ]
+
+    # 1. Try to find parking areas first
+    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": max_distance_m,
+        "type": "parking",
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=5)
+        data = resp.json() if resp.status_code == 200 else {}
+    except Exception:
+        data = {}
+
+    results = data.get("results", [])
+
+    # 2. If no parking found, broaden search (gas station, rest area)
+    if not results:
+        alt_params = {
+            "location": f"{lat},{lng}",
+            "radius": max_distance_m,
+            "keyword": "rest area OR lay-by OR highway stop",
+            "key": GOOGLE_MAPS_API_KEY,
+        }
+        try:
+            resp = requests.get(url, params=alt_params, timeout=5)
+            data = resp.json() if resp.status_code == 200 else {}
+        except Exception:
+            data = {}
+        results = data.get("results", [])
+
+    safe_stops: List[SafeStopPlace] = []
+    for r in results[:max_results]:
+        loc = r.get("geometry", {}).get("location", {})
+        place_id = r.get("place_id")
+        maps_url = (
+            f"https://www.google.com/maps/search/?api=1"
+            f"&query={loc.get('lat')},{loc.get('lng')}"
+        )
+        if place_id:
+            maps_url += f"&query_place_id={place_id}"
+
+        safe_stops.append(
+            SafeStopPlace(
+                name=r.get("name", "Unknown"),
+                lat=loc.get("lat", lat),
+                lng=loc.get("lng", lng),
+                address=r.get("vicinity"),
+                place_id=place_id,
+                type=(r.get("types", ["unknown"])[0] if r.get("types") else None),
+                rating=r.get("rating"),
+                user_ratings_total=r.get("user_ratings_total"),
+                maps_url=maps_url,
+            )
+        )
+
+    return safe_stops
 
 def send_emergency_sms(user_id: str, score: int, event_id: str, timestamp: str):
     """
@@ -299,6 +406,7 @@ def predict(data: DriverData):
 
     # Get physical/system action
     intervention = escalation_action(state["level"])
+    safe_stop_needed = state["level"] >= 3
 
     # Attach escalation info to event record
     event_record["escalation_level"] = state["level"]
@@ -321,6 +429,7 @@ def predict(data: DriverData):
         "status": status,
         "intervention": intervention,
         "escalation_level": state["level"],
+        "safe_stop_needed": safe_stop_needed,
         "mode": data.mode,
         "event_id": event_id,
         "event_type": event_type,
@@ -330,6 +439,93 @@ def predict(data: DriverData):
         "sms_info": sms_message
     }
 
+@app.post("/safe-stop")
+def safe_stop(req: SafeStopRequest):
+    """
+    Safe-Stop Assistant:
+    - Uses current escalation level & trend to decide if we should suggest a safe stop
+    - Returns nearby safe pull-over places (parking / rest area)
+    - Returns 'infotainment actions' (dim lights, reduce volume, etc.)
+    - Logs a 'safe_stop_suggestion' event into the driver's timeline
+    """
+    # 1. Make sure we have escalation data for this user
+    state = driver_escalation_state.get(req.user_id)
+    if state is None or not state.get("recent_scores"):
+        raise HTTPException(status_code=400, detail="No escalation data available for this user yet")
+
+    level = state["level"]
+    last_change = state.get("last_change", time.time())
+    now_ts = time.time()
+
+    # Persistency: has the driver been at level 3+ for > 60 seconds?
+    persistent_high_fatigue = level >= 3 and (now_ts - last_change) > 60.0
+
+    # We recommend safe stop for level 3 and 4
+    safe_stop_recommended = level >= 3
+
+    # 2. Find safe stops via Google Maps / dummy fallback
+    safe_stops: List[SafeStopPlace] = []
+    if safe_stop_recommended:
+        safe_stops = find_safe_stops(
+            lat=req.lat,
+            lng=req.lng,
+            max_distance_m=req.max_distance_m or 5000,
+            max_results=5,
+        )
+
+    # 3. Decide infotainment actions
+    # (Frontend / car system will implement these; backend just suggests)
+    infotainment_actions = {
+        "lower_media_volume_to": 0.3 if level >= 3 else 0.5,
+        "ambient_light_mode": "calm_dim" if level >= 3 else "normal",
+        "suppress_notifications": level >= 3,
+        "voice_prompt": (
+            "High fatigue detected. Please pull over at a safe location."
+            if level >= 3 else
+            "Monitoring driver state."
+        ),
+    }
+
+    # 4. Log this as a timeline event
+    last_score = state["recent_scores"][-1]
+    event_id = str(uuid.uuid4())
+    ts = datetime.now().isoformat()
+
+    event_record = {
+        "event_id": event_id,
+        "timestamp": ts,
+        "user_id": req.user_id,
+        "mode": "unknown",
+        "fatigue_score": last_score,
+        "status": "alert" if level >= 3 else "normal",
+        "event_type": "safe_stop_suggestion",
+        "tags": [
+            "safe_stop",
+            f"escalation_level_{level}",
+        ] + (["persistent_high_fatigue"] if persistent_high_fatigue else []),
+        "eye_ratio": None,
+        "blink_count": None,
+        "head_tilt": None,
+        "yawn_ratio": None,
+        "has_snippet": False,
+        "escalation_level": level,
+        "intervention": "Safe-stop assistant invoked",
+    }
+
+    fatigue_history.append(event_record)
+    if req.user_id not in driver_timeline:
+        driver_timeline[req.user_id] = []
+    driver_timeline[req.user_id].append(event_record)
+
+    return {
+        "user_id": req.user_id,
+        "escalation_level": level,
+        "persistent_high_fatigue": persistent_high_fatigue,
+        "safe_stop_recommended": safe_stop_recommended,
+        "safe_stops": [s.dict() for s in safe_stops],
+        "infotainment_actions": infotainment_actions,
+        "event_id": event_id,
+    }
 
 
 @app.get("/escalation/{user_id}")
