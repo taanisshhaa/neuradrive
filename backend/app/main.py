@@ -20,6 +20,14 @@ from logic import (
 from dotenv import load_dotenv
 load_dotenv()
 
+# Import LangGraph workflow
+from workflow import driver_workflow
+
+# Initialize agent references to global state
+from agents import fatigue_scoring_agent, forecast_agent, escalation_agent
+from agents import emergency_agent, timeline_logging_agent
+
+
 
 from cryptography.fernet import Fernet
 import requests
@@ -84,6 +92,7 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 
 # --- GOOGLE MAPS CONFIG ---
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+
 
 
 def find_safe_stops(
@@ -229,7 +238,16 @@ def send_emergency_sms(user_id: str, score: int, event_id: str, timestamp: str):
     else:
         return False, "Failed to send to all contacts"
 
+# --- AGENT INITIALIZATION ---
+# Connect agents to global state stores (must be after function definitions)
+fatigue_scoring_agent.set_user_profiles(user_profiles)
+forecast_agent.set_driver_escalation_state(driver_escalation_state)
+escalation_agent.set_driver_escalation_state(driver_escalation_state)
+emergency_agent.set_emergency_sms_function(send_emergency_sms)
+timeline_logging_agent.set_global_stores(fatigue_history, driver_timeline, alerts)
+
 # In-memory store
+
 
 
 @app.get("/")
@@ -285,159 +303,56 @@ from logic import compute_fatigue_instant, compute_fatigue_personalized
 
 @app.post("/predict")
 def predict(data: DriverData):
-
-    # 1. Compute fatigue score based on mode
-    if data.mode == "instant":
-        score = compute_fatigue_instant(
-            data.eye_ratio,
-            data.blink_count,
-            data.head_tilt,
-            data.yawn_ratio
-        )
-
-    elif data.mode == "personalized":
-        if data.user_id not in user_profiles:
-            raise HTTPException(status_code=400, detail="User not calibrated")
-
-        score = compute_fatigue_personalized(
-            user_profiles[data.user_id],
-            data.eye_ratio,
-            data.blink_count,
-            data.head_tilt,
-            data.yawn_ratio
-        )
-
-    else:
-        raise HTTPException(status_code=400, detail="Invalid mode")
-
-    status = "alert" if score > 60 else "normal"
-
-    # 2. Derive event_type and tags (for timeline)
-    if score > 80:
-        event_type = "critical_fatigue"
-    elif score > 60:
-        event_type = "fatigue_warning"
-    else:
-        event_type = "normal"
-
-    tags: list[str] = []
-    if event_type != "normal":
-        tags.append(event_type)
-
-    if data.yawn_ratio is not None and data.yawn_ratio > 0.6:
-        tags.append("yawn")
-
-    if data.blink_count > 10:
-        tags.append("high_blink_rate")
-
-    if abs(data.head_tilt) > 15:
-        tags.append("head_tilt")
-
-    # 3. Build event record
-    event_id = str(uuid.uuid4())
-    ts = datetime.now().isoformat()
-
-    event_record = {
-        "event_id": event_id,
-        "timestamp": ts,
+    """
+    Predicts driver fatigue using the LangGraph agentic workflow.
+    
+    The workflow processes data through 8 specialized agents:
+    1. Input Agent - validates and normalizes input
+    2. Fatigue Scoring Agent - computes fatigue score
+    3. Forecast Agent - predicts future trend
+    4. Escalation Agent - determines escalation level
+    5. Intervention Agent - maps to intervention action
+    6. Safe-Stop Agent - sets safe-stop flag
+    7. Emergency Agent - triggers SMS if needed
+    8. Timeline Logging Agent - records to history
+    """
+    
+    # Convert Pydantic model to state dict
+    initial_state = {
         "user_id": data.user_id,
         "mode": data.mode,
-        "fatigue_score": score,
-        "status": status,
-        "event_type": event_type,
-        "tags": tags,
         "eye_ratio": data.eye_ratio,
         "blink_count": data.blink_count,
         "head_tilt": data.head_tilt,
-        "yawn_ratio": data.yawn_ratio,
-        "has_snippet": False
+        "yawn_ratio": data.yawn_ratio
     }
     
-
-    # 4. Append to global histories
-    fatigue_history.append(event_record)
-
-    if data.user_id not in driver_timeline:
-        driver_timeline[data.user_id] = []
-    driver_timeline[data.user_id].append(event_record)
-   
-
-    # 5. Legacy alerts list (optional)
-    alerts.append({"score": score, "status": status})
-
-    # ---------- ADAPTIVE ESCALATION SYSTEM ----------
-
-    now_ts = datetime.now().timestamp()
-
-    # Initialize user state if new
-    if data.user_id not in driver_escalation_state:
-        driver_escalation_state[data.user_id] = {
-            "level": 0,
-            "last_change": now_ts,
-            "recent_scores": []
+    try:
+        # Invoke the LangGraph workflow
+        final_state = driver_workflow.invoke(initial_state)
+        
+        # Extract response from final state
+        return {
+            "fatigue_score": final_state["fatigue_score"],
+            "status": final_state["status"],
+            "intervention": final_state["intervention"],
+            "escalation_level": final_state["escalation_level"],
+            "safe_stop_needed": final_state["safe_stop_needed"],
+            "mode": final_state["mode"],
+            "event_id": final_state["event_id"],
+            "event_type": final_state["event_type"],
+            "tags": final_state["tags"],
+            "forecast": final_state["forecast"],
+            "sms_triggered": final_state["sms_triggered"],
+            "sms_info": final_state["sms_info"]
         }
+    except ValueError as e:
+        # Handle validation errors from agents
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Handle unexpected errors
+        raise HTTPException(status_code=500, detail=f"Workflow error: {str(e)}")
 
-    state = driver_escalation_state[data.user_id]
-
-    # Maintain rolling window of last 10 scores
-    state["recent_scores"].append(score)
-    state["recent_scores"] = state["recent_scores"][-10:]
-
-    # Predict future trend using EMA forecast
-    forecast = forecast_next_scores(state["recent_scores"], steps=5)
-
-    # Decide next escalation level
-    new_level = decide_escalation(
-        level=state["level"],
-        score=score,
-        forecast=forecast
-    )
-
-    # Reset escalation if driver recovers
-    if score < 45:
-        new_level = 0
-
-    old_level = state["level"]
-
-    # Update state if level changed
-    if new_level != state["level"]:
-        state["level"] = new_level
-        state["last_change"] = now_ts
-
-    # Get physical/system action
-    intervention = escalation_action(state["level"])
-    safe_stop_needed = state["level"] >= 3
-
-    # Attach escalation info to event record
-    event_record["escalation_level"] = state["level"]
-    event_record["intervention"] = intervention
-
-    # 🔔 Trigger SMS if we just entered level 4
-    sms_triggered = False
-    sms_message = None
-    if state["level"] == 4 and old_level < 4:
-        sms_triggered, sms_message = send_emergency_sms(
-            user_id=data.user_id,
-            score=score,
-            event_id=event_id,
-            timestamp=ts
-        )
-
-
-    return {
-        "fatigue_score": score,
-        "status": status,
-        "intervention": intervention,
-        "escalation_level": state["level"],
-        "safe_stop_needed": safe_stop_needed,
-        "mode": data.mode,
-        "event_id": event_id,
-        "event_type": event_type,
-        "tags": tags,
-        "forecast": forecast,
-        "sms_triggered": sms_triggered,
-        "sms_info": sms_message
-    }
 
 @app.post("/safe-stop")
 def safe_stop(req: SafeStopRequest):
