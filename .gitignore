@@ -11,6 +11,8 @@ mobilothon/.env
 mobilothon/.env.local
 mobilothon/.env.*.local
 
+backend/app/serviceAccountKey.json
+
 # Generic env files (root or elsewhere)
 .env
 .env.*
