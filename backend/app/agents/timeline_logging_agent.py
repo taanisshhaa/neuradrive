@@ -2,7 +2,7 @@
 Timeline Logging Agent - Records event to timeline and history
 """
 from agent_state import DriverState
-
+import firebase_store
 
 # References to global stores from main.py
 fatigue_history = None
@@ -65,5 +65,5 @@ def timeline_logging_agent(state: DriverState) -> DriverState:
             "score": state["fatigue_score"],
             "status": state["status"]
         })
-    
+    firebase_store.save_event(user_id, event_record)
     return state

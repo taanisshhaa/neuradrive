@@ -1,5 +1,9 @@
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth, firestore
+from firebase_store import db
 
-
+from fastapi import Depends
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from models import DriverData, TimelineEvent, SnippetMeta, EmergencyContact
 from datetime import datetime
@@ -19,6 +23,29 @@ from logic import (
 )
 from dotenv import load_dotenv
 load_dotenv()
+FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS")
+
+firebase_app = None
+db = None
+
+if FIREBASE_CREDENTIALS_PATH and os.path.exists(FIREBASE_CREDENTIALS_PATH):
+    cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+    firebase_app = firebase_admin.initialize_app(cred, {
+        "projectId": os.environ.get("FIREBASE_PROJECT_ID")
+    })
+    db = firestore.client()
+else:
+    # You can log or print a warning here; for now we just skip
+    print("WARNING: Firebase credentials not configured; running without Firestore.")
+import firebase_store 
+
+# after db is created:
+if db is not None:
+    from firebase_store import init_firestore
+    init_firestore(db)
+
+print("🔥 Firebase DB object:", db)
+
 
 # Import LangGraph workflow
 from workflow import driver_workflow
@@ -92,7 +119,46 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 
 # --- GOOGLE MAPS CONFIG ---
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+from fastapi import Depends, Header
 
+class CurrentUser(BaseModel):
+    uid: str
+    email: str | None = None
+    name: str | None = None
+
+def get_current_user(authorization: str = Header(None)) -> CurrentUser:
+    """
+    Validates Firebase ID token from Authorization: Bearer <token>.
+    Returns CurrentUser with uid/email/name.
+    """
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+
+    if firebase_app is None:
+        raise HTTPException(status_code=500, detail="Firebase not initialized on backend")
+
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Firebase ID token: {str(e)}")
+
+    return CurrentUser(
+        uid=decoded.get("uid"),
+        email=decoded.get("email"),
+        name=decoded.get("name") or decoded.get("displayName")
+    )
+
+@app.get("/debug/firestore-events/{user_id}")
+def debug_firestore_events(user_id: str):
+    if db is None:
+        return {"error": "Firestore not initialized"}
+
+    docs = db.collection("users").document(user_id).collection("events").stream()
+    return [doc.to_dict() for doc in docs]
 
 
 def find_safe_stops(
@@ -256,68 +322,92 @@ def home():
 from typing import List
 
 @app.post("/calibrate/{user_id}")
-def calibrate(user_id: str, open_ears: List[float], closed_ears: List[float]):
+def calibrate(
+    user_id: str,
+    open_ears: List[float],
+    closed_ears: List[float],
+    current_user: CurrentUser = Depends(get_current_user),  # can be optional while testing
+):
+    # Optionally assert that user_id == current_user.uid
+    if current_user and current_user.uid != user_id:
+        raise HTTPException(status_code=403, detail="user_id does not match authenticated user")
+
     open_avg = sum(open_ears) / len(open_ears)
     closed_avg = sum(closed_ears) / len(closed_ears)
 
     blink_low = closed_avg + 0.1 * (open_avg - closed_avg)
     blink_high = open_avg - 0.1 * (open_avg - closed_avg)
 
-    user_profiles[user_id] = {
+    profile = {
         "open_ear": open_avg,
         "closed_ear": closed_avg,
         "blink_low": blink_low,
         "blink_high": blink_high,
         "ema_open": open_avg,
-        "ema_closed": closed_avg
+        "ema_closed": closed_avg,
     }
+
+    user_profiles[user_id] = profile
+
+    # Persist to Firestore
+    firebase_store.ensure_user_doc(user_id, email=current_user.email, name=current_user.name)
+    firebase_store.save_calibration(user_id, profile)
 
     return {
         "message": "Calibration complete",
-        "profile": user_profiles[user_id]
+        "profile": profile,
     }
 
 @app.post("/users/{user_id}/emergency-contacts")
-def set_emergency_contacts(user_id: str, contacts: List[EmergencyContact]):
-    """
-    Configure or replace emergency contacts for a user.
-    """
-    emergency_contacts[user_id] = [c.dict() for c in contacts]
+def set_emergency_contacts(
+    user_id: str,
+    contacts: List[EmergencyContact],
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.uid != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    contacts_list = [c.dict() for c in contacts]
+
+    # Update in-memory for SMS agent
+    emergency_contacts[user_id] = contacts_list
+
+    # Persist to Firestore
+    firebase_store.ensure_user_doc(user_id, email=current_user.email, name=current_user.name)
+    firebase_store.save_emergency_contacts(user_id, contacts_list)
+
     return {
         "user_id": user_id,
-        "contacts": emergency_contacts[user_id]
+        "contacts": contacts_list,
     }
+
 
 
 @app.get("/users/{user_id}/emergency-contacts")
-def get_emergency_contacts(user_id: str):
-    """
-    Fetch current emergency contacts for a user.
-    """
+def get_emergency_contacts(
+    user_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.uid != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Prefer in-memory; if empty, try Firestore
+    contacts = emergency_contacts.get(user_id)
+    if contacts is None and db is not None:
+        contacts = firebase_store.load_emergency_contacts(user_id)
+        emergency_contacts[user_id] = contacts
+
     return {
         "user_id": user_id,
-        "contacts": emergency_contacts.get(user_id, [])
+        "contacts": contacts or [],
     }
+
 
 from logic import compute_fatigue_instant, compute_fatigue_personalized
 
 @app.post("/predict")
 def predict(data: DriverData):
-    """
-    Predicts driver fatigue using the LangGraph agentic workflow.
-    
-    The workflow processes data through 8 specialized agents:
-    1. Input Agent - validates and normalizes input
-    2. Fatigue Scoring Agent - computes fatigue score
-    3. Forecast Agent - predicts future trend
-    4. Escalation Agent - determines escalation level
-    5. Intervention Agent - maps to intervention action
-    6. Safe-Stop Agent - sets safe-stop flag
-    7. Emergency Agent - triggers SMS if needed
-    8. Timeline Logging Agent - records to history
-    """
-    
-    # Convert Pydantic model to state dict
+
     initial_state = {
         "user_id": data.user_id,
         "mode": data.mode,
@@ -326,12 +416,64 @@ def predict(data: DriverData):
         "head_tilt": data.head_tilt,
         "yawn_ratio": data.yawn_ratio
     }
-    
+
     try:
-        # Invoke the LangGraph workflow
+        # ✅ Run the LangGraph workflow
         final_state = driver_workflow.invoke(initial_state)
-        
-        # Extract response from final state
+
+        # ✅ BUILD FIRESTORE EVENT OBJECT
+        event_record = {
+            "user_id": final_state["user_id"],
+            "timestamp": final_state.get("timestamp"),
+            "mode": final_state["mode"],
+
+            "fatigue_score": final_state["fatigue_score"],
+            "status": final_state["status"],
+            "escalation_level": final_state["escalation_level"],
+            "safe_stop_needed": final_state["safe_stop_needed"],
+
+            "event_id": final_state["event_id"],
+            "event_type": final_state["event_type"],
+            "tags": final_state["tags"],
+
+            "eye_ratio": data.eye_ratio,
+            "blink_count": data.blink_count,
+            "head_tilt": data.head_tilt,
+            "yawn_ratio": data.yawn_ratio,
+
+            "forecast": final_state["forecast"],
+
+            "sms_triggered": final_state["sms_triggered"],
+            "sms_info": final_state["sms_info"]
+        }
+
+        # ✅ SAVE TO FIRESTORE (THIS WAS MISSING)
+        if db is not None:
+            print("✅ Saving prediction to Firestore")
+
+            db.collection("users") \
+              .document(data.user_id) \
+              .collection("events") \
+              .document(final_state["event_id"]) \
+              .set(event_record)
+
+            # also update escalation state
+            db.collection("users") \
+              .document(data.user_id) \
+              .collection("state") \
+              .document("escalation") \
+              .set({
+                  "level": final_state["escalation_level"],
+                  "last_update": final_state.get("timestamp"),
+                  "safe_stop_needed": final_state["safe_stop_needed"]
+              })
+
+            print("✅ Prediction stored in Firestore")
+
+        else:
+            print("❌ Firestore DB is None inside /predict")
+
+        # ✅ RETURN RESPONSE TO CLIENT
         return {
             "fatigue_score": final_state["fatigue_score"],
             "status": final_state["status"],
@@ -346,11 +488,11 @@ def predict(data: DriverData):
             "sms_triggered": final_state["sms_triggered"],
             "sms_info": final_state["sms_info"]
         }
+
     except ValueError as e:
-        # Handle validation errors from agents
         raise HTTPException(status_code=400, detail=str(e))
+
     except Exception as e:
-        # Handle unexpected errors
         raise HTTPException(status_code=500, detail=f"Workflow error: {str(e)}")
 
 
@@ -563,6 +705,7 @@ async def upload_snippet(
         "share_token": share_token
     }
     incident_snippets[event_id] = snippet_meta
+    firebase_store.save_snippet_meta(snippet_meta)
 
     return {
         "message": "Snippet uploaded and encrypted",
@@ -576,6 +719,26 @@ def get_shared_snippet_meta(share_token: str):
     Returns minimal info for a shared incident snippet, identified by share_token.
     Does NOT expose file path (you can later add a secure download endpoint).
     """
+
+    meta = firebase_store.get_snippet_meta_by_token(share_token)
+    if meta:
+        user_id = meta["user_id"]
+        events = driver_timeline.get(user_id, [])
+        event = next((e for e in events if e["event_id"] == meta["event_id"]), None)
+        # If not in memory, you can also load from Firestore later
+        return {
+            "event": {
+                "event_id": meta["event_id"],
+                "timestamp": event["timestamp"] if event else meta["created_at"],
+                "user_id": user_id,
+                "mode": event["mode"] if event else "unknown",
+                "fatigue_score": event["fatigue_score"] if event else None,
+                "status": event["status"] if event else "alert",
+                "event_type": event["event_type"] if event else "critical_fatigue",
+                "tags": event["tags"] if event else [],
+            },
+            "snippet_available": True,
+        }
     # Find snippet by token
     for event_id, meta in incident_snippets.items():
         if meta.get("share_token") == share_token:

@@ -5,7 +5,7 @@ from datetime import datetime
 from agent_state import DriverState
 from logic import decide_escalation
 
-
+import firebase_store
 # Reference to driver_escalation_state from main.py
 driver_escalation_state = None
 
@@ -70,6 +70,7 @@ def escalation_agent(state: DriverState) -> DriverState:
         if new_level != old_level:
             user_state["level"] = new_level
             user_state["last_change"] = datetime.now().timestamp()
+            firebase_store.save_escalation_state(user_id, user_state)
         else:
             user_state["level"] = new_level
     
